@@ -3,11 +3,14 @@
  *
  * Creates auto-locks while the agent is running and exposes /lock, /release,
  * /wait, and /lock-list commands for cross-instance coordination.
+ *
+ * Also registers tools so the LLM can wait for locks programmatically.
  */
 
 import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 
 const LOCK_DIR = "/tmp/pi-locks";
 
@@ -386,6 +389,159 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 		description: "List locks in /tmp/pi-locks",
 		handler: async (_args, ctx) => {
 			await showLockList(ctx);
+		},
+	});
+
+	// Note: User bash commands (! and !!) don't create auto-locks because
+	// there's no "user_bash_end" event to release them. The lock would persist
+	// until the next agent prompt, which could cause issues.
+
+	// Register tools so the LLM can use them programmatically
+	pi.registerTool({
+		name: "semaphore_wait",
+		label: "Wait for Lock",
+		description:
+			"Wait for a semaphore lock to be released. Use this to coordinate with other pi instances. " +
+			"The lock name is typically the directory basename where another pi instance is running. " +
+			"For example, if another pi is working in /tmp/my-project, the lock name would be 'my-project'.",
+		parameters: Type.Object({
+			name: Type.String({ description: "Name of the lock to wait for" }),
+		}),
+		async execute(_toolCallId, params, signal, onUpdate) {
+			const safeName = sanitizeName(params.name);
+			const targetPath = await resolveLockTarget(safeName);
+
+			if (!targetPath) {
+				return {
+					content: [{ type: "text", text: `Lock '${safeName}' not found. It may have already been released.` }],
+					details: { found: false, name: safeName },
+				};
+			}
+
+			onUpdate?.({
+				content: [{ type: "text", text: `Waiting for lock: ${safeName}...` }],
+			});
+
+			// Create a promise that resolves when file is deleted or signal is aborted
+			await new Promise<void>((resolve, reject) => {
+				if (signal?.aborted) {
+					resolve();
+					return;
+				}
+
+				const abortHandler = () => {
+					watcher.close();
+					resolve();
+				};
+
+				signal?.addEventListener("abort", abortHandler, { once: true });
+
+				const watcher = fs.watch(LOCK_DIR, (_eventType, filename) => {
+					if (!filename || filename !== path.basename(targetPath)) {
+						return;
+					}
+					void exists(targetPath)
+						.then((stillExists) => {
+							if (!stillExists) {
+								watcher.close();
+								signal?.removeEventListener("abort", abortHandler);
+								resolve();
+							}
+						})
+						.catch((error) => {
+							watcher.close();
+							signal?.removeEventListener("abort", abortHandler);
+							reject(error);
+						});
+				});
+
+				watcher.on("error", (error) => {
+					watcher.close();
+					signal?.removeEventListener("abort", abortHandler);
+					reject(error);
+				});
+
+				// Check if already deleted
+				void exists(targetPath)
+					.then((stillExists) => {
+						if (!stillExists) {
+							watcher.close();
+							signal?.removeEventListener("abort", abortHandler);
+							resolve();
+						}
+					})
+					.catch((error) => {
+						watcher.close();
+						signal?.removeEventListener("abort", abortHandler);
+						reject(error);
+					});
+			});
+
+			if (signal?.aborted) {
+				return {
+					content: [{ type: "text", text: `Wait for lock '${safeName}' was cancelled.` }],
+					details: { found: true, name: safeName, cancelled: true },
+				};
+			}
+
+			return {
+				content: [{ type: "text", text: `Lock '${safeName}' has been released.` }],
+				details: { found: true, name: safeName, released: true },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "semaphore_list",
+		label: "List Locks",
+		description: "List all semaphore locks currently held in /tmp/pi-locks.",
+		parameters: Type.Object({}),
+		async execute() {
+			await ensureLockDir();
+			let entries: string[] = [];
+			try {
+				entries = await fsp.readdir(LOCK_DIR);
+			} catch (error) {
+				const err = error as NodeJS.ErrnoException;
+				if (err.code === "ENOENT") {
+					return {
+						content: [{ type: "text", text: "No locks found." }],
+						details: { locks: [] },
+					};
+				}
+				throw error;
+			}
+
+			entries.sort();
+			const locks: Array<{ name: string; target?: string }> = [];
+
+			for (const entry of entries) {
+				const entryPath = path.join(LOCK_DIR, entry);
+				const info = await lstatMaybe(entryPath);
+				if (!info) {
+					continue;
+				}
+				if (info.isSymbolicLink()) {
+					const target = await fsp.readlink(entryPath);
+					const resolved = path.resolve(path.dirname(entryPath), target);
+					locks.push({ name: entry, target: resolved });
+				} else {
+					locks.push({ name: entry });
+				}
+			}
+
+			if (locks.length === 0) {
+				return {
+					content: [{ type: "text", text: "No locks found." }],
+					details: { locks: [] },
+				};
+			}
+
+			const lines = locks.map((l) => (l.target ? `${l.name} -> ${l.target}` : l.name));
+			return {
+				content: [{ type: "text", text: `Locks:\n${lines.join("\n")}` }],
+				details: { locks },
+			};
 		},
 	});
 }

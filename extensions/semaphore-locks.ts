@@ -205,12 +205,211 @@ async function waitForDeletion(targetPath: string): Promise<void> {
 	});
 }
 
+async function waitForDeletionWithSignal(targetPath: string, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) {
+		return false;
+	}
+
+	if (!(await exists(targetPath))) {
+		return true;
+	}
+
+	return new Promise<boolean>((resolve, reject) => {
+		let watcher: fs.FSWatcher | null = null;
+		const abortHandler = () => {
+			watcher?.close();
+			resolve(false);
+		};
+
+		signal?.addEventListener("abort", abortHandler, { once: true });
+
+		watcher = fs.watch(LOCK_DIR, (_eventType, filename) => {
+			if (!filename || filename !== path.basename(targetPath)) {
+				return;
+			}
+			void exists(targetPath)
+				.then((stillExists) => {
+					if (!stillExists) {
+						watcher.close();
+						signal?.removeEventListener("abort", abortHandler);
+						resolve(true);
+					}
+				})
+				.catch((error) => {
+					watcher.close();
+					signal?.removeEventListener("abort", abortHandler);
+					reject(error);
+				});
+		});
+
+		watcher.on("error", (error) => {
+			watcher.close();
+			signal?.removeEventListener("abort", abortHandler);
+			reject(error);
+		});
+
+		void exists(targetPath)
+			.then((stillExists) => {
+				if (!stillExists) {
+					watcher.close();
+					signal?.removeEventListener("abort", abortHandler);
+					resolve(true);
+				}
+			})
+			.catch((error) => {
+				watcher.close();
+				signal?.removeEventListener("abort", abortHandler);
+				reject(error);
+			});
+	});
+}
+
+async function waitForAnyDeletion(targets: Array<{ name: string; targetPath: string }>): Promise<string> {
+	const targetsByBasename = new Map<string, { name: string; targetPath: string }>();
+	for (const target of targets) {
+		targetsByBasename.set(path.basename(target.targetPath), target);
+	}
+
+	for (const target of targets) {
+		if (!(await exists(target.targetPath))) {
+			return target.name;
+		}
+	}
+
+	return new Promise<string>((resolve, reject) => {
+		const watcher = fs.watch(LOCK_DIR, (_eventType, filename) => {
+			if (!filename) {
+				return;
+			}
+			const target = targetsByBasename.get(filename);
+			if (!target) {
+				return;
+			}
+			void exists(target.targetPath)
+				.then((stillExists) => {
+					if (!stillExists) {
+						watcher.close();
+						resolve(target.name);
+					}
+				})
+				.catch((error) => {
+					watcher.close();
+					reject(error);
+				});
+		});
+
+		watcher.on("error", (error) => {
+			watcher.close();
+			reject(error);
+		});
+
+		void Promise.all(targets.map((target) => exists(target.targetPath)))
+			.then((results) => {
+				const missingIndex = results.findIndex((result) => !result);
+				if (missingIndex >= 0) {
+					watcher.close();
+					resolve(targets[missingIndex].name);
+				}
+			})
+			.catch((error) => {
+				watcher.close();
+				reject(error);
+			});
+	});
+}
+
+async function waitForAnyDeletionWithSignal(
+	targets: Array<{ name: string; targetPath: string }>,
+	signal?: AbortSignal,
+): Promise<{ releasedName?: string; cancelled: boolean }> {
+	if (signal?.aborted) {
+		return { cancelled: true };
+	}
+
+	const targetsByBasename = new Map<string, { name: string; targetPath: string }>();
+	for (const target of targets) {
+		targetsByBasename.set(path.basename(target.targetPath), target);
+	}
+
+	for (const target of targets) {
+		if (!(await exists(target.targetPath))) {
+			return { releasedName: target.name, cancelled: false };
+		}
+	}
+
+	return new Promise<{ releasedName?: string; cancelled: boolean }>((resolve, reject) => {
+		let watcher: fs.FSWatcher | null = null;
+		const abortHandler = () => {
+			watcher?.close();
+			resolve({ cancelled: true });
+		};
+
+		signal?.addEventListener("abort", abortHandler, { once: true });
+
+		watcher = fs.watch(LOCK_DIR, (_eventType, filename) => {
+			if (!filename) {
+				return;
+			}
+			const target = targetsByBasename.get(filename);
+			if (!target) {
+				return;
+			}
+			void exists(target.targetPath)
+				.then((stillExists) => {
+					if (!stillExists) {
+						watcher?.close();
+						signal?.removeEventListener("abort", abortHandler);
+						resolve({ releasedName: target.name, cancelled: false });
+					}
+				})
+				.catch((error) => {
+					watcher?.close();
+					signal?.removeEventListener("abort", abortHandler);
+					reject(error);
+				});
+		});
+
+		watcher.on("error", (error) => {
+			watcher?.close();
+			signal?.removeEventListener("abort", abortHandler);
+			reject(error);
+		});
+
+		void Promise.all(targets.map((target) => exists(target.targetPath)))
+			.then((results) => {
+				const missingIndex = results.findIndex((result) => !result);
+				if (missingIndex >= 0) {
+					watcher?.close();
+					signal?.removeEventListener("abort", abortHandler);
+					resolve({ releasedName: targets[missingIndex].name, cancelled: false });
+				}
+			})
+			.catch((error) => {
+				watcher?.close();
+				signal?.removeEventListener("abort", abortHandler);
+				reject(error);
+			});
+	});
+}
+
 function parseName(args: string | undefined, fallback: string): string {
 	const name = args?.trim();
 	if (!name) {
 		return fallback;
 	}
 	return sanitizeName(name);
+}
+
+function parseNames(args: string | undefined): string[] {
+	const raw = args?.trim();
+	if (!raw) {
+		return [];
+	}
+	return raw
+		.split(/\s+/)
+		.map((name) => name.trim())
+		.filter((name) => name.length > 0)
+		.map((name) => sanitizeName(name));
 }
 
 async function showLockList(ctx: ExtensionCommandContext): Promise<void> {
@@ -363,25 +562,40 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("wait", {
-		description: "Wait for a named lock to be released",
+		description: "Wait for any of the named locks to be released",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				return;
 			}
-			const name = args?.trim();
-			if (!name) {
-				ctx.ui.notify("Usage: /wait <name>", "warning");
+			const names = parseNames(args);
+			if (names.length === 0) {
+				ctx.ui.notify("Usage: /wait <name> [name...]", "warning");
 				return;
 			}
-			const safeName = sanitizeName(name);
-			const targetPath = await resolveLockTarget(safeName);
-			if (!targetPath) {
-				ctx.ui.notify(`Lock not found: ${safeName}`, "warning");
+
+			const entries = await Promise.all(
+				names.map(async (name) => ({
+					name,
+					targetPath: await resolveLockTarget(name),
+				})),
+			);
+
+			const missing = entries.filter((entry) => !entry.targetPath).map((entry) => entry.name);
+			if (missing.length > 0) {
+				ctx.ui.notify(`Lock not found: ${missing.join(", ")}`, "warning");
+			}
+
+			const targets = entries.filter(
+				(entry): entry is { name: string; targetPath: string } => Boolean(entry.targetPath),
+			);
+			if (targets.length === 0) {
 				return;
 			}
-			ctx.ui.notify(`Waiting for lock: ${safeName}`, "info");
-			await waitForDeletion(targetPath);
-			ctx.ui.notify(`Lock released: ${safeName}`, "info");
+
+			const waitNames = targets.map((entry) => entry.name);
+			ctx.ui.notify(`Waiting for any lock: ${waitNames.join(", ")}`, "info");
+			const releasedName = await waitForAnyDeletion(targets);
+			ctx.ui.notify(`Lock released: ${releasedName}`, "info");
 		},
 	});
 
@@ -399,94 +613,72 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 	// Register tools so the LLM can use them programmatically
 	pi.registerTool({
 		name: "semaphore_wait",
-		label: "Wait for Lock",
+		label: "Wait for Locks",
 		description:
-			"Wait for a semaphore lock to be released. Use this to coordinate with other pi instances. " +
-			"The lock name is typically the directory basename where another pi instance is running. " +
+			"Wait for one of many semaphore locks to be released. Use this to coordinate with other pi instances. " +
+			"Lock names are typically the directory basenames where other pi instances are running. " +
 			"For example, if another pi is working in /tmp/my-project, the lock name would be 'my-project'.",
 		parameters: Type.Object({
-			name: Type.String({ description: "Name of the lock to wait for" }),
+			name: Type.Optional(Type.String({ description: "Name of the lock to wait for" })),
+			names: Type.Optional(Type.Array(Type.String({ description: "Names of the locks to wait for" }))),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const safeName = sanitizeName(params.name);
-			const targetPath = await resolveLockTarget(safeName);
+			const rawNames = params.names && params.names.length > 0 ? params.names : params.name ? [params.name] : [];
+			const safeNames = rawNames.map((name) => sanitizeName(name)).filter((name) => name.length > 0);
 
-			if (!targetPath) {
+			if (safeNames.length === 0) {
 				return {
-					content: [{ type: "text", text: `Lock '${safeName}' not found. It may have already been released.` }],
-					details: { found: false, name: safeName },
+					content: [{ type: "text", text: "No lock names provided." }],
+					details: { found: false, names: [] },
 				};
 			}
 
+			const entries = await Promise.all(
+				safeNames.map(async (name) => ({
+					name,
+					targetPath: await resolveLockTarget(name),
+				})),
+			);
+
+			const missing = entries.filter((entry) => !entry.targetPath).map((entry) => entry.name);
+			const targets = entries.filter(
+				(entry): entry is { name: string; targetPath: string } => Boolean(entry.targetPath),
+			);
+
+			if (targets.length === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Locks not found: ${missing.join(", ")}. They may have already been released.`,
+						},
+					],
+					details: { found: false, names: safeNames, missing },
+				};
+			}
+
+			const waitNames = targets.map((entry) => entry.name);
 			onUpdate?.({
-				content: [{ type: "text", text: `Waiting for lock: ${safeName}...` }],
+				content: [{ type: "text", text: `Waiting for any lock: ${waitNames.join(", ")}...` }],
 			});
 
-			// Create a promise that resolves when file is deleted or signal is aborted
-			await new Promise<void>((resolve, reject) => {
-				if (signal?.aborted) {
-					resolve();
-					return;
-				}
+			const result = await waitForAnyDeletionWithSignal(targets, signal);
 
-				const abortHandler = () => {
-					watcher.close();
-					resolve();
-				};
-
-				signal?.addEventListener("abort", abortHandler, { once: true });
-
-				const watcher = fs.watch(LOCK_DIR, (_eventType, filename) => {
-					if (!filename || filename !== path.basename(targetPath)) {
-						return;
-					}
-					void exists(targetPath)
-						.then((stillExists) => {
-							if (!stillExists) {
-								watcher.close();
-								signal?.removeEventListener("abort", abortHandler);
-								resolve();
-							}
-						})
-						.catch((error) => {
-							watcher.close();
-							signal?.removeEventListener("abort", abortHandler);
-							reject(error);
-						});
-				});
-
-				watcher.on("error", (error) => {
-					watcher.close();
-					signal?.removeEventListener("abort", abortHandler);
-					reject(error);
-				});
-
-				// Check if already deleted
-				void exists(targetPath)
-					.then((stillExists) => {
-						if (!stillExists) {
-							watcher.close();
-							signal?.removeEventListener("abort", abortHandler);
-							resolve();
-						}
-					})
-					.catch((error) => {
-						watcher.close();
-						signal?.removeEventListener("abort", abortHandler);
-						reject(error);
-					});
-			});
-
-			if (signal?.aborted) {
+			if (result.cancelled) {
 				return {
-					content: [{ type: "text", text: `Wait for lock '${safeName}' was cancelled.` }],
-					details: { found: true, name: safeName, cancelled: true },
+					content: [{ type: "text", text: `Wait for locks '${waitNames.join(", ")}' was cancelled.` }],
+					details: { found: true, names: waitNames, missing, cancelled: true },
 				};
 			}
+
+			const releasedName = result.releasedName ?? waitNames[0];
+			const releasedMessage = missing.length
+				? `Lock released: ${releasedName}. Missing: ${missing.join(", ")}.`
+				: `Lock released: ${releasedName}.`;
 
 			return {
-				content: [{ type: "text", text: `Lock '${safeName}' has been released.` }],
-				details: { found: true, name: safeName, released: true },
+				content: [{ type: "text", text: releasedMessage }],
+				details: { found: true, names: waitNames, missing, released: true, releasedName },
 			};
 		},
 	});

@@ -32,7 +32,7 @@ When the agent finishes, the lock files are removed.
 |---------|-------------|
 | `/lock [name]` | Create a named lock (fails if exists) |
 | `/release [name]` | Release a named lock |
-| `/wait <name>` | Wait for a lock to be released |
+| `/wait <name> [name...]` | Wait for any of the named locks to be released |
 | `/lock-list` | List all locks in `/tmp/pi-locks/` |
 
 ## Example Usage
@@ -50,6 +50,14 @@ In terminal 2:
 Waiting for lock: my-app
 # ... blocks until terminal 1 finishes ...
 Lock released: my-app
+```
+
+Waiting for multiple locks:
+```
+> /wait my-app deploy
+Waiting for any lock: my-app, deploy
+# ... blocks until one is released ...
+Lock released: deploy
 ```
 
 ### Explicit locks

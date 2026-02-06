@@ -16,11 +16,7 @@ pi -e git:github.com/offline-ant/pi-semaphore
 
 ## How It Works
 
-While the agent is processing a prompt, automatic locks are created in `/tmp/pi-locks/`:
-
-- `<name>.<cmd-idx>.<pid>` - The actual lock file
-- `<name>.<cmd-idx>` - Symlink to the lock file
-- `<name>` - Symlink to the latest lock file
+While the agent is processing a prompt, a lock file is created in `/tmp/pi-locks/<name>`.
 
 The default `<name>` is determined by:
 1. The `PI_LOCK_NAME` environment variable (if set)
@@ -28,9 +24,7 @@ The default `<name>` is determined by:
 
 If another instance already holds a lock with the same name, a suffix is appended (`-2`, `-3`, etc.) to ensure uniqueness.
 
-The `<cmd-idx>` increments per user prompt. The `<pid>` is the process ID.
-
-When the agent finishes, the lock files are removed.
+When the agent finishes processing, the lock file is removed and an idle marker (`idle:<name>`) is created to indicate the instance is waiting for input.
 
 ## Environment Variables
 
@@ -42,7 +36,7 @@ When the agent finishes, the lock files are removed.
 
 | Command | Description |
 |---------|-------------|
-| `/lock [name]` | Create a named lock (fails if exists) |
+| `/lock [name]` | Create a named lock (auto-deduplicates if exists) |
 | `/release [name]` | Release a named lock |
 | `/wait <name> [name...]` | Wait for any of the named locks to be released |
 | `/lock-list` | List all locks in `/tmp/pi-locks/` |
@@ -92,9 +86,8 @@ Lock released: deploy
 ```
 > /lock-list
 Locks:
-my-app -> /tmp/pi-locks/my-app.3.12345
-my-app.3 -> /tmp/pi-locks/my-app.3.12345
-my-app.3.12345
+my-app
+idle:other-project
 deploy
 ```
 
@@ -129,7 +122,7 @@ Both agents now share the tmux session. The supervisor (window 1) can:
 The supervisor monitors the worker and keeps it running:
 
 ```
-1. semaphore_list - find the worker's active lock (e.g., my-app.5.12345)
+1. semaphore_list - find the worker's active lock (e.g., my-app)
 2. semaphore_wait - block until the worker finishes its current step
 3. tmux capture-pane -t %0 -p -S -50 - check output and context usage
 4. Decide what to do:

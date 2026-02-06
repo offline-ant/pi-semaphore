@@ -15,15 +15,6 @@ import { Type } from "@sinclair/typebox";
 const LOCK_DIR = "/tmp/pi-locks";
 const IDLE_PREFIX = "idle:";
 
-interface AutoLock {
-	name: string;
-	cmdIndex: number;
-	pid: number;
-	filePath: string;
-	indexLinkPath: string;
-	nameLinkPath: string;
-}
-
 export function sanitizeName(name: string): string {
 	return name.trim().replace(/[\\/]/g, "-").replace(/\s+/g, "-");
 }
@@ -54,66 +45,48 @@ async function ensureLockDir(): Promise<void> {
 	}
 }
 
-async function lstatMaybe(filePath: string): Promise<fs.Stats | null> {
+async function fileExists(filePath: string): Promise<boolean> {
 	try {
-		return await fsp.lstat(filePath);
+		await fsp.access(filePath, fs.constants.F_OK);
+		return true;
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		if (err.code === "ENOENT") {
-			return null;
+			return false;
 		}
 		throw error;
 	}
 }
 
+async function unlinkIfExists(filePath: string): Promise<void> {
+	try {
+		await fsp.unlink(filePath);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code !== "ENOENT") {
+			throw error;
+		}
+	}
+}
+
 /**
  * Find a unique name by appending -2, -3, etc. if the base name is taken.
- * A name is considered "taken" if the base symlink exists and points to a valid lock.
  */
 async function findUniqueName(baseName: string): Promise<string> {
 	await ensureLockDir();
-	const baseLinkPath = path.join(LOCK_DIR, baseName);
+	const basePath = path.join(LOCK_DIR, baseName);
 
-	// Check if base name is available (no symlink or dangling symlink)
-	const baseInfo = await lstatMaybe(baseLinkPath);
-	if (!baseInfo) {
+	if (!(await fileExists(basePath))) {
 		return baseName;
-	}
-	if (baseInfo.isSymbolicLink()) {
-		// Check if symlink target exists
-		try {
-			await fsp.stat(baseLinkPath); // follows symlink
-		} catch (error) {
-			const err = error as NodeJS.ErrnoException;
-			if (err.code === "ENOENT") {
-				// Dangling symlink - clean it up and use base name
-				await unlinkIfExists(baseLinkPath);
-				return baseName;
-			}
-			throw error;
-		}
 	}
 
 	// Base name is taken, find a unique suffix
 	let n = 2;
 	while (n < 1000) {
 		const candidateName = `${baseName}-${n}`;
-		const candidateLinkPath = path.join(LOCK_DIR, candidateName);
-		const info = await lstatMaybe(candidateLinkPath);
-		if (!info) {
+		const candidatePath = path.join(LOCK_DIR, candidateName);
+		if (!(await fileExists(candidatePath))) {
 			return candidateName;
-		}
-		if (info.isSymbolicLink()) {
-			try {
-				await fsp.stat(candidateLinkPath);
-			} catch (error) {
-				const err = error as NodeJS.ErrnoException;
-				if (err.code === "ENOENT") {
-					await unlinkIfExists(candidateLinkPath);
-					return candidateName;
-				}
-				throw error;
-			}
 		}
 		n++;
 	}
@@ -123,6 +96,10 @@ async function findUniqueName(baseName: string): Promise<string> {
 
 function getIdleMarkerPath(name: string): string {
 	return path.join(LOCK_DIR, `${IDLE_PREFIX}${name}`);
+}
+
+function getLockPath(name: string): string {
+	return path.join(LOCK_DIR, name);
 }
 
 async function clearIdleMarkers(): Promise<void> {
@@ -151,17 +128,6 @@ async function createIdleMarker(name: string): Promise<void> {
 	await fsp.writeFile(markerPath, `${name}\n`, { mode: 0o666 });
 }
 
-async function unlinkIfExists(filePath: string): Promise<void> {
-	try {
-		await fsp.unlink(filePath);
-	} catch (error) {
-		const err = error as NodeJS.ErrnoException;
-		if (err.code !== "ENOENT") {
-			throw error;
-		}
-	}
-}
-
 /**
  * Create a simple named lock with automatic deduplication.
  * If the name is taken, appends -2, -3, etc. to find a unique name.
@@ -172,7 +138,7 @@ export async function createLock(name: string): Promise<{ name: string; path: st
 	await ensureLockDir();
 	const safeName = sanitizeName(name);
 	const uniqueName = await findUniqueName(safeName);
-	const lockPath = path.join(LOCK_DIR, uniqueName);
+	const lockPath = getLockPath(uniqueName);
 	try {
 		await fsp.writeFile(lockPath, `${uniqueName}\n`, { mode: 0o666, flag: "wx" });
 		return { name: uniqueName, path: lockPath };
@@ -186,230 +152,28 @@ export async function createLock(name: string): Promise<{ name: string; path: st
 }
 
 /**
- * Release a simple named lock. Returns true if released, false if not found or is a symlink (auto-lock).
+ * Release a named lock. Returns true if released, false if not found.
  */
 export async function releaseLock(name: string): Promise<boolean> {
 	await ensureLockDir();
 	const safeName = sanitizeName(name);
-	const lockPath = path.join(LOCK_DIR, safeName);
-	const existing = await lstatMaybe(lockPath);
-	if (!existing) {
-		return false;
-	}
-	// Don't release auto-locks (symlinks)
-	if (existing.isSymbolicLink()) {
+	const lockPath = getLockPath(safeName);
+	if (!(await fileExists(lockPath))) {
 		return false;
 	}
 	await unlinkIfExists(lockPath);
 	return true;
 }
 
-async function replaceSymlink(targetPath: string, linkPath: string): Promise<void> {
-	const existing = await lstatMaybe(linkPath);
-	if (existing) {
-		if (!existing.isSymbolicLink()) {
-			return;
-		}
-		await unlinkIfExists(linkPath);
-	}
-	await fsp.symlink(targetPath, linkPath);
-}
-
-async function removeSymlinkIfTarget(linkPath: string, targetPath: string): Promise<void> {
-	const existing = await lstatMaybe(linkPath);
-	if (!existing?.isSymbolicLink()) {
-		return;
-	}
-	const linkTarget = await fsp.readlink(linkPath);
-	const resolved = path.resolve(path.dirname(linkPath), linkTarget);
-	if (resolved === targetPath) {
-		await unlinkIfExists(linkPath);
-	}
-}
-
-async function createAutoLock(name: string, cmdIndex: number): Promise<AutoLock> {
-	await ensureLockDir();
-	await clearIdleMarkers();
-	const pid = process.pid;
-	const fileName = `${name}.${cmdIndex}.${pid}`;
-	const filePath = path.join(LOCK_DIR, fileName);
-	const indexLinkPath = path.join(LOCK_DIR, `${name}.${cmdIndex}`);
-	const nameLinkPath = path.join(LOCK_DIR, name);
-
-	try {
-		await fsp.writeFile(filePath, `${fileName}\n`, { mode: 0o666, flag: "wx" });
-	} catch (error) {
-		const err = error as NodeJS.ErrnoException;
-		if (err.code === "EEXIST") {
-			await fsp.writeFile(filePath, `${fileName}\n`, { mode: 0o666 });
-		} else {
-			throw error;
-		}
-	}
-
-	await replaceSymlink(filePath, indexLinkPath);
-	await replaceSymlink(filePath, nameLinkPath);
-
-	return {
-		name,
-		cmdIndex,
-		pid,
-		filePath,
-		indexLinkPath,
-		nameLinkPath,
-	};
-}
-
-async function clearAutoLock(lock: AutoLock): Promise<void> {
-	await unlinkIfExists(lock.filePath);
-	await unlinkIfExists(lock.indexLinkPath);
-	await removeSymlinkIfTarget(lock.nameLinkPath, lock.filePath);
-	await createIdleMarker(lock.name);
-}
-
-async function resolveLockTarget(name: string): Promise<string | null> {
-	await ensureLockDir();
-	const lockPath = path.join(LOCK_DIR, name);
-	const info = await lstatMaybe(lockPath);
-	if (!info) {
-		return null;
-	}
-	if (info.isSymbolicLink()) {
-		try {
-			return await fsp.realpath(lockPath);
-		} catch (error) {
-			const err = error as NodeJS.ErrnoException;
-			if (err.code === "ENOENT") {
-				return null;
-			}
-			throw error;
-		}
-	}
-	return lockPath;
-}
-
-async function exists(filePath: string): Promise<boolean> {
-	try {
-		await fsp.access(filePath, fs.constants.F_OK);
-		return true;
-	} catch (error) {
-		const err = error as NodeJS.ErrnoException;
-		if (err.code === "ENOENT") {
-			return false;
-		}
-		throw error;
-	}
-}
-
-async function waitForDeletion(targetPath: string): Promise<void> {
-	if (!(await exists(targetPath))) {
-		return;
-	}
-
-	await new Promise<void>((resolve, reject) => {
-		const watcher = fs.watch(LOCK_DIR, (_eventType, filename) => {
-			if (!filename || filename !== path.basename(targetPath)) {
-				return;
-			}
-			void exists(targetPath)
-				.then((stillExists) => {
-					if (!stillExists) {
-						watcher.close();
-						resolve();
-					}
-				})
-				.catch((error) => {
-					watcher.close();
-					reject(error);
-				});
-		});
-
-		watcher.on("error", (error) => {
-			watcher.close();
-			reject(error);
-		});
-
-		void exists(targetPath)
-			.then((stillExists) => {
-				if (!stillExists) {
-					watcher.close();
-					resolve();
-				}
-			})
-			.catch((error) => {
-				watcher.close();
-				reject(error);
-			});
-	});
-}
-
-async function waitForDeletionWithSignal(targetPath: string, signal?: AbortSignal): Promise<boolean> {
-	if (signal?.aborted) {
-		return false;
-	}
-
-	if (!(await exists(targetPath))) {
-		return true;
-	}
-
-	return new Promise<boolean>((resolve, reject) => {
-		let watcher: fs.FSWatcher | null = null;
-		const abortHandler = () => {
-			watcher?.close();
-			resolve(false);
-		};
-
-		signal?.addEventListener("abort", abortHandler, { once: true });
-
-		watcher = fs.watch(LOCK_DIR, (_eventType, filename) => {
-			if (!filename || filename !== path.basename(targetPath)) {
-				return;
-			}
-			void exists(targetPath)
-				.then((stillExists) => {
-					if (!stillExists) {
-						watcher.close();
-						signal?.removeEventListener("abort", abortHandler);
-						resolve(true);
-					}
-				})
-				.catch((error) => {
-					watcher.close();
-					signal?.removeEventListener("abort", abortHandler);
-					reject(error);
-				});
-		});
-
-		watcher.on("error", (error) => {
-			watcher.close();
-			signal?.removeEventListener("abort", abortHandler);
-			reject(error);
-		});
-
-		void exists(targetPath)
-			.then((stillExists) => {
-				if (!stillExists) {
-					watcher.close();
-					signal?.removeEventListener("abort", abortHandler);
-					resolve(true);
-				}
-			})
-			.catch((error) => {
-				watcher.close();
-				signal?.removeEventListener("abort", abortHandler);
-				reject(error);
-			});
-	});
-}
-
-async function waitForAnyDeletion(targets: Array<{ name: string; targetPath: string }>): Promise<string> {
-	const targetsByBasename = new Map<string, { name: string; targetPath: string }>();
+async function waitForAnyDeletion(targets: Array<{ name: string; lockPath: string }>): Promise<string> {
+	const pathsByBasename = new Map<string, { name: string; lockPath: string }>();
 	for (const target of targets) {
-		targetsByBasename.set(path.basename(target.targetPath), target);
+		pathsByBasename.set(path.basename(target.lockPath), target);
 	}
 
+	// Check if any already deleted
 	for (const target of targets) {
-		if (!(await exists(target.targetPath))) {
+		if (!(await fileExists(target.lockPath))) {
 			return target.name;
 		}
 	}
@@ -419,11 +183,11 @@ async function waitForAnyDeletion(targets: Array<{ name: string; targetPath: str
 			if (!filename) {
 				return;
 			}
-			const target = targetsByBasename.get(filename);
+			const target = pathsByBasename.get(filename);
 			if (!target) {
 				return;
 			}
-			void exists(target.targetPath)
+			void fileExists(target.lockPath)
 				.then((stillExists) => {
 					if (!stillExists) {
 						watcher.close();
@@ -441,9 +205,10 @@ async function waitForAnyDeletion(targets: Array<{ name: string; targetPath: str
 			reject(error);
 		});
 
-		void Promise.all(targets.map((target) => exists(target.targetPath)))
+		// Double-check after watcher is set up
+		void Promise.all(targets.map((target) => fileExists(target.lockPath)))
 			.then((results) => {
-				const missingIndex = results.findIndex((result) => !result);
+				const missingIndex = results.findIndex((exists) => !exists);
 				if (missingIndex >= 0) {
 					watcher.close();
 					resolve(targets[missingIndex].name);
@@ -457,20 +222,21 @@ async function waitForAnyDeletion(targets: Array<{ name: string; targetPath: str
 }
 
 async function waitForAnyDeletionWithSignal(
-	targets: Array<{ name: string; targetPath: string }>,
+	targets: Array<{ name: string; lockPath: string }>,
 	signal?: AbortSignal,
 ): Promise<{ releasedName?: string; cancelled: boolean }> {
 	if (signal?.aborted) {
 		return { cancelled: true };
 	}
 
-	const targetsByBasename = new Map<string, { name: string; targetPath: string }>();
+	const pathsByBasename = new Map<string, { name: string; lockPath: string }>();
 	for (const target of targets) {
-		targetsByBasename.set(path.basename(target.targetPath), target);
+		pathsByBasename.set(path.basename(target.lockPath), target);
 	}
 
+	// Check if any already deleted
 	for (const target of targets) {
-		if (!(await exists(target.targetPath))) {
+		if (!(await fileExists(target.lockPath))) {
 			return { releasedName: target.name, cancelled: false };
 		}
 	}
@@ -488,11 +254,11 @@ async function waitForAnyDeletionWithSignal(
 			if (!filename) {
 				return;
 			}
-			const target = targetsByBasename.get(filename);
+			const target = pathsByBasename.get(filename);
 			if (!target) {
 				return;
 			}
-			void exists(target.targetPath)
+			void fileExists(target.lockPath)
 				.then((stillExists) => {
 					if (!stillExists) {
 						watcher?.close();
@@ -513,9 +279,10 @@ async function waitForAnyDeletionWithSignal(
 			reject(error);
 		});
 
-		void Promise.all(targets.map((target) => exists(target.targetPath)))
+		// Double-check after watcher is set up
+		void Promise.all(targets.map((target) => fileExists(target.lockPath)))
 			.then((results) => {
-				const missingIndex = results.findIndex((result) => !result);
+				const missingIndex = results.findIndex((exists) => !exists);
 				if (missingIndex >= 0) {
 					watcher?.close();
 					signal?.removeEventListener("abort", abortHandler);
@@ -569,83 +336,79 @@ async function showLockList(ctx: ExtensionCommandContext): Promise<void> {
 	}
 
 	entries.sort();
-	const lines: string[] = [];
-
-	for (const entry of entries) {
-		const entryPath = path.join(LOCK_DIR, entry);
-		const info = await lstatMaybe(entryPath);
-		if (!info) {
-			continue;
-		}
-		if (info.isSymbolicLink()) {
-			const target = await fsp.readlink(entryPath);
-			const resolved = path.resolve(path.dirname(entryPath), target);
-			lines.push(`${entry} -> ${resolved}`);
-		} else {
-			lines.push(entry);
-		}
-	}
-
-	if (lines.length === 0) {
+	if (entries.length === 0) {
 		ctx.ui.notify("No locks found.", "info");
 		return;
 	}
 
-	ctx.ui.notify(`Locks:\n${lines.join("\n")}`, "info");
+	ctx.ui.notify(`Locks:\n${entries.join("\n")}`, "info");
 }
 
 export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 	let defaultName = "session";
-	let cmdIndex = 0;
-	let autoLock: AutoLock | null = null;
+	let currentLockName: string | null = null;
 
-	async function releaseAutoLock(): Promise<void> {
-		if (!autoLock) {
+	async function acquireLock(name: string): Promise<void> {
+		await ensureLockDir();
+		await clearIdleMarkers();
+		const lockPath = getLockPath(name);
+		try {
+			await fsp.writeFile(lockPath, `${name}\n`, { mode: 0o666, flag: "wx" });
+		} catch (error) {
+			const err = error as NodeJS.ErrnoException;
+			if (err.code === "EEXIST") {
+				// Overwrite if we own it (same name)
+				await fsp.writeFile(lockPath, `${name}\n`, { mode: 0o666 });
+			} else {
+				throw error;
+			}
+		}
+		currentLockName = name;
+	}
+
+	async function releaseCurrentLock(): Promise<void> {
+		if (!currentLockName) {
 			return;
 		}
-		const current = autoLock;
-		autoLock = null;
-		await clearAutoLock(current);
+		const name = currentLockName;
+		currentLockName = null;
+		await unlinkIfExists(getLockPath(name));
+		await createIdleMarker(name);
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureLockDir();
 		const baseName = getDefaultName(ctx);
 		defaultName = await findUniqueName(baseName);
-		cmdIndex = 0;
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		const baseName = getDefaultName(ctx);
 		defaultName = await findUniqueName(baseName);
-		cmdIndex = 0;
 	});
 
 	pi.on("session_fork", async (_event, ctx) => {
 		const baseName = getDefaultName(ctx);
 		defaultName = await findUniqueName(baseName);
-		cmdIndex = 0;
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
-		await releaseAutoLock();
-		cmdIndex += 1;
-		const name = parseName(undefined, defaultName);
-		autoLock = await createAutoLock(name, cmdIndex);
+		await releaseCurrentLock();
+		await acquireLock(defaultName);
 		if (ctx.hasUI) {
-			ctx.ui.setStatus("locks", `Locked: ${name}.${cmdIndex}.${autoLock.pid}`);
+			ctx.ui.setStatus("locks", `Locked: ${defaultName}`);
 		}
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		await releaseAutoLock();
+		await releaseCurrentLock();
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("locks", undefined);
 		}
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		await releaseAutoLock();
+		await releaseCurrentLock();
 		await clearIdleMarkers();
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("locks", undefined);
@@ -658,24 +421,12 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			if (!ctx.hasUI) {
 				return;
 			}
-			await ensureLockDir();
 			const name = parseName(args, defaultName);
-			const lockPath = path.join(LOCK_DIR, name);
-			const existing = await lstatMaybe(lockPath);
-			if (existing) {
+			const result = await createLock(name);
+			if (result) {
+				ctx.ui.notify(`Lock created: ${result.name}`, "info");
+			} else {
 				ctx.ui.notify(`Lock already exists: ${name}`, "warning");
-				return;
-			}
-			try {
-				await fsp.writeFile(lockPath, `${name}\n`, { mode: 0o666, flag: "wx" });
-				ctx.ui.notify(`Lock created: ${name}`, "info");
-			} catch (error) {
-				const err = error as NodeJS.ErrnoException;
-				if (err.code === "EEXIST") {
-					ctx.ui.notify(`Lock already exists: ${name}`, "warning");
-					return;
-				}
-				throw error;
 			}
 		},
 	});
@@ -686,20 +437,13 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			if (!ctx.hasUI) {
 				return;
 			}
-			await ensureLockDir();
 			const name = parseName(args, defaultName);
-			const lockPath = path.join(LOCK_DIR, name);
-			const existing = await lstatMaybe(lockPath);
-			if (!existing) {
+			const released = await releaseLock(name);
+			if (released) {
+				ctx.ui.notify(`Lock released: ${name}`, "info");
+			} else {
 				ctx.ui.notify(`Lock not found: ${name}`, "warning");
-				return;
 			}
-			if (existing.isSymbolicLink()) {
-				ctx.ui.notify(`Refusing to release auto lock: ${name}`, "warning");
-				return;
-			}
-			await unlinkIfExists(lockPath);
-			ctx.ui.notify(`Lock released: ${name}`, "info");
 		},
 	});
 
@@ -715,26 +459,27 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const entries = await Promise.all(
-				names.map(async (name) => ({
-					name,
-					targetPath: await resolveLockTarget(name),
-				})),
-			);
+			const targets: Array<{ name: string; lockPath: string }> = [];
+			const missing: string[] = [];
 
-			const missing = entries.filter((entry) => !entry.targetPath).map((entry) => entry.name);
+			for (const name of names) {
+				const lockPath = getLockPath(name);
+				if (await fileExists(lockPath)) {
+					targets.push({ name, lockPath });
+				} else {
+					missing.push(name);
+				}
+			}
+
 			if (missing.length > 0) {
 				ctx.ui.notify(`Lock not found: ${missing.join(", ")}`, "warning");
 			}
 
-			const targets = entries.filter(
-				(entry): entry is { name: string; targetPath: string } => Boolean(entry.targetPath),
-			);
 			if (targets.length === 0) {
 				return;
 			}
 
-			const waitNames = targets.map((entry) => entry.name);
+			const waitNames = targets.map((t) => t.name);
 			ctx.ui.notify(`Waiting for any lock: ${waitNames.join(", ")}`, "info");
 			const releasedName = await waitForAnyDeletion(targets);
 			ctx.ui.notify(`Lock released: ${releasedName}`, "info");
@@ -748,11 +493,6 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Note: User bash commands (! and !!) don't create auto-locks because
-	// there's no "user_bash_end" event to release them. The lock would persist
-	// until the next agent prompt, which could cause issues.
-
-	// Register tools so the LLM can use them programmatically
 	pi.registerTool({
 		name: "semaphore_wait",
 		label: "Wait for Locks",
@@ -775,17 +515,17 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			const entries = await Promise.all(
-				safeNames.map(async (name) => ({
-					name,
-					targetPath: await resolveLockTarget(name),
-				})),
-			);
+			const targets: Array<{ name: string; lockPath: string }> = [];
+			const missing: string[] = [];
 
-			const missing = entries.filter((entry) => !entry.targetPath).map((entry) => entry.name);
-			const targets = entries.filter(
-				(entry): entry is { name: string; targetPath: string } => Boolean(entry.targetPath),
-			);
+			for (const name of safeNames) {
+				const lockPath = getLockPath(name);
+				if (await fileExists(lockPath)) {
+					targets.push({ name, lockPath });
+				} else {
+					missing.push(name);
+				}
+			}
 
 			if (targets.length === 0) {
 				return {
@@ -799,7 +539,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			const waitNames = targets.map((entry) => entry.name);
+			const waitNames = targets.map((t) => t.name);
 			onUpdate?.({
 				content: [{ type: "text", text: `Waiting for any lock: ${waitNames.join(", ")}...` }],
 				details: { waiting: true, names: waitNames },
@@ -833,7 +573,6 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			}
 
 			if (result.cancelled) {
-				// Distinguish between abort and steering
 				const reason = ctx.hasPendingMessages()
 					? "New user message received while waiting."
 					: "Wait was cancelled.";
@@ -880,37 +619,19 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			}
 
 			entries.sort();
-			const locks: Array<{ name: string; target?: string }> = [];
-
-			for (const entry of entries) {
-				const entryPath = path.join(LOCK_DIR, entry);
-				const info = await lstatMaybe(entryPath);
-				if (!info) {
-					continue;
-				}
-				if (info.isSymbolicLink()) {
-					const target = await fsp.readlink(entryPath);
-					const resolved = path.resolve(path.dirname(entryPath), target);
-					locks.push({ name: entry, target: resolved });
-				} else {
-					locks.push({ name: entry });
-				}
-			}
-
-			if (locks.length === 0) {
+			if (entries.length === 0) {
 				return {
 					content: [{ type: "text", text: "No locks found." }],
 					details: { locks: [] },
 				};
 			}
 
-			const lines = locks.map((l) => (l.target ? `${l.name} -> ${l.target}` : l.name));
 			const semantics =
-				"\nSemantics: '<name>' or '<name>.<idx>.<pid>' = pi instance is active (processing). " +
+				"\nSemantics: '<name>' = pi instance is active (processing). " +
 				"'idle:<name>' = pi instance is idle (waiting for user input).";
 			return {
-				content: [{ type: "text", text: `Locks:\n${lines.join("\n")}${semantics}` }],
-				details: { locks },
+				content: [{ type: "text", text: `Locks:\n${entries.join("\n")}${semantics}` }],
+				details: { locks: entries.map((name) => ({ name })) },
 			};
 		},
 	});

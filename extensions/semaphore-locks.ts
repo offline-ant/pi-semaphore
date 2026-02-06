@@ -499,7 +499,8 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 		description:
 			"Wait for one of many semaphore locks to be released. Use this to coordinate with other pi instances. " +
 			"Lock names are typically the directory basenames where other pi instances are running. " +
-			"For example, if another pi is working in /tmp/my-project, the lock name would be 'my-project'.",
+			"For example, if another pi is working in /tmp/my-project, the lock name would be 'my-project'. " +
+			"For agents spawned via tmux-coding-agent, wait on the window name (e.g., 'worker'), NOT 'tmux:worker'.",
 		parameters: Type.Object({
 			name: Type.Optional(Type.String({ description: "Name of the lock to wait for" })),
 			names: Type.Optional(Type.Array(Type.String({ description: "Names of the locks to wait for" }))),

@@ -13,6 +13,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@m
 import { Type } from "@sinclair/typebox";
 
 const LOCK_DIR = "/tmp/pi-locks";
+const IDLE_PREFIX = "idle:";
 
 interface AutoLock {
 	name: string;
@@ -23,11 +24,19 @@ interface AutoLock {
 	nameLinkPath: string;
 }
 
-function sanitizeName(name: string): string {
+export function sanitizeName(name: string): string {
 	return name.trim().replace(/[\\/]/g, "-").replace(/\s+/g, "-");
 }
 
 function getDefaultName(ctx: ExtensionContext): string {
+	// Prefer explicit lock name from env (set by tmux-bash when spawning pi)
+	if (process.env.PI_LOCK_NAME) {
+		const safe = sanitizeName(process.env.PI_LOCK_NAME);
+		if (safe.length > 0) {
+			return safe;
+		}
+	}
+	// Fall back to directory basename
 	const base = path.basename(ctx.cwd || process.cwd());
 	const safe = sanitizeName(base || "session");
 	return safe.length > 0 ? safe : "session";
@@ -57,6 +66,91 @@ async function lstatMaybe(filePath: string): Promise<fs.Stats | null> {
 	}
 }
 
+/**
+ * Find a unique name by appending -2, -3, etc. if the base name is taken.
+ * A name is considered "taken" if the base symlink exists and points to a valid lock.
+ */
+async function findUniqueName(baseName: string): Promise<string> {
+	await ensureLockDir();
+	const baseLinkPath = path.join(LOCK_DIR, baseName);
+
+	// Check if base name is available (no symlink or dangling symlink)
+	const baseInfo = await lstatMaybe(baseLinkPath);
+	if (!baseInfo) {
+		return baseName;
+	}
+	if (baseInfo.isSymbolicLink()) {
+		// Check if symlink target exists
+		try {
+			await fsp.stat(baseLinkPath); // follows symlink
+		} catch (error) {
+			const err = error as NodeJS.ErrnoException;
+			if (err.code === "ENOENT") {
+				// Dangling symlink - clean it up and use base name
+				await unlinkIfExists(baseLinkPath);
+				return baseName;
+			}
+			throw error;
+		}
+	}
+
+	// Base name is taken, find a unique suffix
+	let n = 2;
+	while (n < 1000) {
+		const candidateName = `${baseName}-${n}`;
+		const candidateLinkPath = path.join(LOCK_DIR, candidateName);
+		const info = await lstatMaybe(candidateLinkPath);
+		if (!info) {
+			return candidateName;
+		}
+		if (info.isSymbolicLink()) {
+			try {
+				await fsp.stat(candidateLinkPath);
+			} catch (error) {
+				const err = error as NodeJS.ErrnoException;
+				if (err.code === "ENOENT") {
+					await unlinkIfExists(candidateLinkPath);
+					return candidateName;
+				}
+				throw error;
+			}
+		}
+		n++;
+	}
+	// Fallback: use PID to guarantee uniqueness
+	return `${baseName}-${process.pid}`;
+}
+
+function getIdleMarkerPath(name: string): string {
+	return path.join(LOCK_DIR, `${IDLE_PREFIX}${name}`);
+}
+
+async function clearIdleMarkers(): Promise<void> {
+	await ensureLockDir();
+	let entries: string[] = [];
+	try {
+		entries = await fsp.readdir(LOCK_DIR);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") {
+			return;
+		}
+		throw error;
+	}
+
+	await Promise.all(
+		entries
+			.filter((entry) => entry.startsWith(IDLE_PREFIX))
+			.map((entry) => unlinkIfExists(path.join(LOCK_DIR, entry))),
+	);
+}
+
+async function createIdleMarker(name: string): Promise<void> {
+	await ensureLockDir();
+	const markerPath = getIdleMarkerPath(name);
+	await fsp.writeFile(markerPath, `${name}\n`, { mode: 0o666 });
+}
+
 async function unlinkIfExists(filePath: string): Promise<void> {
 	try {
 		await fsp.unlink(filePath);
@@ -66,6 +160,48 @@ async function unlinkIfExists(filePath: string): Promise<void> {
 			throw error;
 		}
 	}
+}
+
+/**
+ * Create a simple named lock with automatic deduplication.
+ * If the name is taken, appends -2, -3, etc. to find a unique name.
+ * Returns { name, path } with the actual name used, or null on failure.
+ * Use releaseLock() to release it.
+ */
+export async function createLock(name: string): Promise<{ name: string; path: string } | null> {
+	await ensureLockDir();
+	const safeName = sanitizeName(name);
+	const uniqueName = await findUniqueName(safeName);
+	const lockPath = path.join(LOCK_DIR, uniqueName);
+	try {
+		await fsp.writeFile(lockPath, `${uniqueName}\n`, { mode: 0o666, flag: "wx" });
+		return { name: uniqueName, path: lockPath };
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "EEXIST") {
+			return null;
+		}
+		throw error;
+	}
+}
+
+/**
+ * Release a simple named lock. Returns true if released, false if not found or is a symlink (auto-lock).
+ */
+export async function releaseLock(name: string): Promise<boolean> {
+	await ensureLockDir();
+	const safeName = sanitizeName(name);
+	const lockPath = path.join(LOCK_DIR, safeName);
+	const existing = await lstatMaybe(lockPath);
+	if (!existing) {
+		return false;
+	}
+	// Don't release auto-locks (symlinks)
+	if (existing.isSymbolicLink()) {
+		return false;
+	}
+	await unlinkIfExists(lockPath);
+	return true;
 }
 
 async function replaceSymlink(targetPath: string, linkPath: string): Promise<void> {
@@ -93,6 +229,7 @@ async function removeSymlinkIfTarget(linkPath: string, targetPath: string): Prom
 
 async function createAutoLock(name: string, cmdIndex: number): Promise<AutoLock> {
 	await ensureLockDir();
+	await clearIdleMarkers();
 	const pid = process.pid;
 	const fileName = `${name}.${cmdIndex}.${pid}`;
 	const filePath = path.join(LOCK_DIR, fileName);
@@ -127,6 +264,7 @@ async function clearAutoLock(lock: AutoLock): Promise<void> {
 	await unlinkIfExists(lock.filePath);
 	await unlinkIfExists(lock.indexLinkPath);
 	await removeSymlinkIfTarget(lock.nameLinkPath, lock.filePath);
+	await createIdleMarker(lock.name);
 }
 
 async function resolveLockTarget(name: string): Promise<string | null> {
@@ -471,18 +609,21 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		defaultName = getDefaultName(ctx);
-		cmdIndex = 0;
 		await ensureLockDir();
+		const baseName = getDefaultName(ctx);
+		defaultName = await findUniqueName(baseName);
+		cmdIndex = 0;
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
-		defaultName = getDefaultName(ctx);
+		const baseName = getDefaultName(ctx);
+		defaultName = await findUniqueName(baseName);
 		cmdIndex = 0;
 	});
 
 	pi.on("session_fork", async (_event, ctx) => {
-		defaultName = getDefaultName(ctx);
+		const baseName = getDefaultName(ctx);
+		defaultName = await findUniqueName(baseName);
 		cmdIndex = 0;
 	});
 
@@ -505,6 +646,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		await releaseAutoLock();
+		await clearIdleMarkers();
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("locks", undefined);
 		}
@@ -622,7 +764,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			name: Type.Optional(Type.String({ description: "Name of the lock to wait for" })),
 			names: Type.Optional(Type.Array(Type.String({ description: "Names of the locks to wait for" }))),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const rawNames = params.names && params.names.length > 0 ? params.names : params.name ? [params.name] : [];
 			const safeNames = rawNames.map((name) => sanitizeName(name)).filter((name) => name.length > 0);
 
@@ -650,7 +792,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Locks not found: ${missing.join(", ")}. They may have already been released.`,
+							text: `Locks not found: ${missing.join(", ")}. They may have already been released or the instance exited.`,
 						},
 					],
 					details: { found: false, names: safeNames, missing },
@@ -660,21 +802,54 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			const waitNames = targets.map((entry) => entry.name);
 			onUpdate?.({
 				content: [{ type: "text", text: `Waiting for any lock: ${waitNames.join(", ")}...` }],
+				details: { waiting: true, names: waitNames },
 			});
 
-			const result = await waitForAnyDeletionWithSignal(targets, signal);
+			// Create a combined abort controller that fires on either:
+			// 1. The tool's signal (Ctrl+C abort)
+			// 2. A new user message (steering) arriving
+			const combinedController = new AbortController();
+			const combinedSignal = combinedController.signal;
+
+			// Forward the tool's abort signal
+			if (signal?.aborted) {
+				combinedController.abort();
+			} else {
+				signal?.addEventListener("abort", () => combinedController.abort(), { once: true });
+			}
+
+			// Poll for pending steering messages
+			const pollInterval = setInterval(() => {
+				if (ctx.hasPendingMessages()) {
+					combinedController.abort();
+				}
+			}, 200);
+
+			let result: { releasedName?: string; cancelled: boolean };
+			try {
+				result = await waitForAnyDeletionWithSignal(targets, combinedSignal);
+			} finally {
+				clearInterval(pollInterval);
+			}
 
 			if (result.cancelled) {
+				// Distinguish between abort and steering
+				const reason = ctx.hasPendingMessages()
+					? "New user message received while waiting."
+					: "Wait was cancelled.";
 				return {
-					content: [{ type: "text", text: `Wait for locks '${waitNames.join(", ")}' was cancelled.` }],
+					content: [{ type: "text", text: `Wait for locks '${waitNames.join(", ")}' cancelled. ${reason}` }],
 					details: { found: true, names: waitNames, missing, cancelled: true },
 				};
 			}
 
 			const releasedName = result.releasedName ?? waitNames[0];
+			const semantics =
+				"The pi instance is now idle (waiting for user input). " +
+				"Use semaphore_list to check state: '<name>' = active, 'idle:<name>' = waiting for input.";
 			const releasedMessage = missing.length
-				? `Lock released: ${releasedName}. Missing: ${missing.join(", ")}.`
-				: `Lock released: ${releasedName}.`;
+				? `Lock '${releasedName}' released. Missing: ${missing.join(", ")}.\n\n${semantics}`
+				: `Lock '${releasedName}' released.\n\n${semantics}`;
 
 			return {
 				content: [{ type: "text", text: releasedMessage }],
@@ -730,8 +905,11 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			}
 
 			const lines = locks.map((l) => (l.target ? `${l.name} -> ${l.target}` : l.name));
+			const semantics =
+				"\nSemantics: '<name>' or '<name>.<idx>.<pid>' = pi instance is active (processing). " +
+				"'idle:<name>' = pi instance is idle (waiting for user input).";
 			return {
-				content: [{ type: "text", text: `Locks:\n${lines.join("\n")}` }],
+				content: [{ type: "text", text: `Locks:\n${lines.join("\n")}${semantics}` }],
 				details: { locks },
 			};
 		},

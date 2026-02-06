@@ -22,9 +22,21 @@ While the agent is processing a prompt, automatic locks are created in `/tmp/pi-
 - `<name>.<cmd-idx>` - Symlink to the lock file
 - `<name>` - Symlink to the latest lock file
 
-The default `<name>` is the project directory basename. The `<cmd-idx>` increments per user prompt. The `<pid>` is the process ID.
+The default `<name>` is determined by:
+1. The `PI_LOCK_NAME` environment variable (if set)
+2. Otherwise, the project directory basename
+
+If another instance already holds a lock with the same name, a suffix is appended (`-2`, `-3`, etc.) to ensure uniqueness.
+
+The `<cmd-idx>` increments per user prompt. The `<pid>` is the process ID.
 
 When the agent finishes, the lock files are removed.
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `PI_LOCK_NAME` | Override the default lock name (useful when spawning pi from tmux windows) |
 
 ## Commands
 

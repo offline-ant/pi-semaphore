@@ -2,12 +2,21 @@
   "name": "pi-semaphore",
   "version": "1.0.0",
   "description": "Semaphore locks for pi - coordinate multiple pi instances",
-  "keywords": ["pi-package", "semaphore", "locks"],
+  "keywords": [
+    "pi-package",
+    "semaphore",
+    "locks"
+  ],
   "license": "MIT",
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*"
   },
   "pi": {
-    "extensions": ["./extensions/semaphore-locks.ts"]
+    "extensions": [
+      "./extensions/semaphore-locks.ts"
+    ]
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

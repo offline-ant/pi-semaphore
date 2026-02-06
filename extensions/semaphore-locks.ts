@@ -498,6 +498,8 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 		label: "Wait for Locks",
 		description:
 			"Wait for one of many semaphore locks to be released. Use this to coordinate with other pi instances. " +
+			"IMPORTANT: This call BLOCKS until a lock is released — you cannot do any other work while waiting. " +
+			"Finish all independent tasks BEFORE calling this. " +
 			"Lock names are typically the directory basenames where other pi instances are running. " +
 			"For example, if another pi is working in /tmp/my-project, the lock name would be 'my-project'. " +
 			"For agents spawned via tmux-coding-agent, wait on the window name (e.g., 'worker'), NOT 'tmux:worker'.",

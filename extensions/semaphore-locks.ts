@@ -605,12 +605,9 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			}
 
 			const releasedName = result.releasedName ?? waitNames[0];
-			const semantics =
-				"The pi instance is now idle (waiting for user input). " +
-				"Use semaphore_list to check state: '<name>' = active, 'idle:<name>' = waiting for input.";
 			const releasedMessage = missing.length
-				? `Finished: lock '${releasedName}' released. Missing: ${missing.join(", ")}.\n\n${semantics}`
-				: `Finished: lock '${releasedName}' released.\n\n${semantics}`;
+				? `Lock '${releasedName}' released. Missing: ${missing.join(", ")}.`
+				: `Lock '${releasedName}' released.`;
 
 			return {
 				content: [{ type: "text", text: releasedMessage }],

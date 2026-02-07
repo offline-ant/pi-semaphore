@@ -506,10 +506,15 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			name: Type.Optional(Type.String({ description: "Name of the lock to wait for" })),
 			names: Type.Optional(Type.Array(Type.String({ description: "Names of the locks to wait for" }))),
+			timeoutSeconds: Type.Optional(
+				Type.Number({ description: "Timeout in seconds before cancelling the wait (default: 120)" }),
+			),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const rawNames = params.names && params.names.length > 0 ? params.names : params.name ? [params.name] : [];
 			const safeNames = rawNames.map((name) => sanitizeName(name)).filter((name) => name.length > 0);
+			const timeoutSeconds =
+				typeof params.timeoutSeconds === "number" && params.timeoutSeconds > 0 ? params.timeoutSeconds : 120;
 
 			if (safeNames.length === 0) {
 				return {
@@ -568,20 +573,34 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 				}
 			}, 200);
 
+			let timeoutTriggered = false;
+			const timeoutHandle = setTimeout(() => {
+				timeoutTriggered = true;
+				combinedController.abort();
+			}, Math.max(0, Math.round(timeoutSeconds * 1000)));
+
 			let result: { releasedName?: string; cancelled: boolean };
 			try {
 				result = await waitForAnyDeletionWithSignal(targets, combinedSignal);
 			} finally {
 				clearInterval(pollInterval);
+				clearTimeout(timeoutHandle);
 			}
 
 			if (result.cancelled) {
-				const reason = ctx.hasPendingMessages()
-					? "New user message received while waiting."
-					: "Wait was cancelled.";
+				const reason = timeoutTriggered
+					? `Timed out after ${timeoutSeconds}s.`
+					: ctx.hasPendingMessages()
+						? "New user message received while waiting."
+						: "Wait was cancelled.";
 				return {
-					content: [{ type: "text", text: `Wait for locks '${waitNames.join(", ")}' cancelled. ${reason}` }],
-					details: { found: true, names: waitNames, missing, cancelled: true },
+					content: [
+						{
+							type: "text",
+							text: `Finished: ${reason} Waiting for locks '${waitNames.join(", ")}' cancelled.`,
+						},
+					],
+					details: { found: true, names: waitNames, missing, cancelled: true, reason },
 				};
 			}
 
@@ -590,8 +609,8 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 				"The pi instance is now idle (waiting for user input). " +
 				"Use semaphore_list to check state: '<name>' = active, 'idle:<name>' = waiting for input.";
 			const releasedMessage = missing.length
-				? `Lock '${releasedName}' released. Missing: ${missing.join(", ")}.\n\n${semantics}`
-				: `Lock '${releasedName}' released.\n\n${semantics}`;
+				? `Finished: lock '${releasedName}' released. Missing: ${missing.join(", ")}.\n\n${semantics}`
+				: `Finished: lock '${releasedName}' released.\n\n${semantics}`;
 
 			return {
 				content: [{ type: "text", text: releasedMessage }],

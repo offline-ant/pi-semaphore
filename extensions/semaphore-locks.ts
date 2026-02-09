@@ -471,11 +471,9 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 				}
 			}
 
+			// If any lock doesn't exist, it's already released — return immediately.
 			if (missing.length > 0) {
-				ctx.ui.notify(`Lock not found: ${missing.join(", ")}`, "warning");
-			}
-
-			if (targets.length === 0) {
+				ctx.ui.notify(`Lock '${missing[0]}' already released (not found).`, "info");
 				return;
 			}
 
@@ -535,15 +533,17 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			if (targets.length === 0) {
+			// If any requested lock doesn't exist, it's already "released" —
+			// return immediately since we wait for ANY lock to be released.
+			if (missing.length > 0) {
+				const releasedName = missing[0];
+				const msg =
+					targets.length > 0
+						? `Lock '${releasedName}' already released (not found). Still active: ${targets.map((t) => t.name).join(", ")}.`
+						: `Lock '${releasedName}' already released (not found).`;
 				return {
-					content: [
-						{
-							type: "text",
-							text: `Locks not found: ${missing.join(", ")}. They may have already been released or the instance exited.`,
-						},
-					],
-					details: { found: false, names: safeNames, missing },
+					content: [{ type: "text", text: msg }],
+					details: { found: false, names: safeNames, missing, released: true, releasedName },
 				};
 			}
 

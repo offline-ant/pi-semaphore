@@ -447,43 +447,6 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("wait", {
-		description: "Wait for any of the named locks to be released",
-		handler: async (args, ctx) => {
-			if (!ctx.hasUI) {
-				return;
-			}
-			const names = parseNames(args);
-			if (names.length === 0) {
-				ctx.ui.notify("Usage: /wait <name> [name...]", "warning");
-				return;
-			}
-
-			const targets: Array<{ name: string; lockPath: string }> = [];
-			const missing: string[] = [];
-
-			for (const name of names) {
-				const lockPath = getLockPath(name);
-				if (await fileExists(lockPath)) {
-					targets.push({ name, lockPath });
-				} else {
-					missing.push(name);
-				}
-			}
-
-			// If any lock doesn't exist, it's already released — return immediately.
-			if (missing.length > 0) {
-				ctx.ui.notify(`Lock '${missing[0]}' already released (not found).`, "info");
-				return;
-			}
-
-			const waitNames = targets.map((t) => t.name);
-			ctx.ui.notify(`Waiting for any lock: ${waitNames.join(", ")}`, "info");
-			const releasedName = await waitForAnyDeletion(targets);
-			ctx.ui.notify(`Lock released: ${releasedName}`, "info");
-		},
-	});
-
 	pi.registerCommand("lock-list", {
 		description: "List locks in /tmp/pi-locks",
 		handler: async (_args, ctx) => {

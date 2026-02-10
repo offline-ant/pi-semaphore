@@ -14,9 +14,11 @@ Or try without installing:
 pi -e git:github.com/offline-ant/pi-semaphore
 ```
 
+> **Note:** This extension assumes [pi-tmux](https://github.com/offline-ant/pi-tmux) is also installed.
+
 ## How It Works
 
-While the agent is processing a prompt, a lock file is created in `/tmp/pi-locks/<name>`.
+While the agent is processing a prompt, a lock file is created in `/tmp/pi-semaphores/<name>`.
 
 The default `<name>` is determined by:
 1. The `PI_LOCK_NAME` environment variable (if set)
@@ -39,7 +41,7 @@ When the agent finishes processing, the lock file is removed and an idle marker 
 | `/lock [name]` | Create a named lock (auto-deduplicates if exists) |
 | `/release [name]` | Release a named lock |
 | `/wait <name> [name...]` | Wait for any of the named locks to be released |
-| `/lock-list` | List all locks in `/tmp/pi-locks/` |
+| `/lock-list` | List all locks in `/tmp/pi-semaphores/` |
 
 ## Example Usage
 
@@ -122,7 +124,7 @@ Both agents now share the tmux session. The supervisor (window 1) can:
 The supervisor monitors the worker and keeps it running:
 
 ```
-1. semaphore_list - find the worker's active lock (e.g., my-app)
+1. bash('ls /tmp/pi-semaphores') - find the worker's active lock (e.g., my-app)
 2. semaphore_wait - block until the worker finishes its current step
 3. tmux capture-pane -t %0 -p -S -50 - check output and context usage
 4. Decide what to do:

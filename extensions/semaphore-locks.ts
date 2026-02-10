@@ -12,7 +12,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-const LOCK_DIR = "/tmp/pi-locks";
+const LOCK_DIR = "/tmp/pi-semaphores";
 const IDLE_PREFIX = "idle:";
 
 export function sanitizeName(name: string): string {
@@ -416,7 +416,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("lock", {
-		description: "Create a named lock in /tmp/pi-locks",
+		description: "Create a named lock in /tmp/pi-semaphores",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				return;
@@ -432,7 +432,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("release", {
-		description: "Release a named lock in /tmp/pi-locks",
+		description: "Release a named lock in /tmp/pi-semaphores",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				return;
@@ -448,7 +448,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("lock-list", {
-		description: "List locks in /tmp/pi-locks",
+		description: "List locks in /tmp/pi-semaphores",
 		handler: async (_args, ctx) => {
 			await showLockList(ctx);
 		},
@@ -463,7 +463,8 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			"Finish all independent tasks BEFORE calling this. " +
 			"Lock names are typically the directory basenames where other pi instances are running. " +
 			"For example, if another pi is working in /tmp/my-project, the lock name would be 'my-project'. " +
-			"For agents spawned via tmux-coding-agent, wait on the window name (e.g., 'worker'), NOT 'tmux:worker'.",
+			"For agents spawned via tmux-coding-agent, wait on the window name (e.g., 'worker'), NOT 'tmux:worker'. " +
+			"To list current locks before waiting, use bash('ls /tmp/pi-semaphores').",
 		parameters: Type.Object({
 			name: Type.Optional(Type.String({ description: "Name of the lock to wait for" })),
 			names: Type.Optional(Type.Array(Type.String({ description: "Names of the locks to wait for" }))),
@@ -575,45 +576,6 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: releasedMessage }],
 				details: { found: true, names: waitNames, missing, released: true, releasedName },
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "semaphore_list",
-		label: "List Locks",
-		description: "List all semaphore locks currently held in /tmp/pi-locks.",
-		parameters: Type.Object({}),
-		async execute() {
-			await ensureLockDir();
-			let entries: string[] = [];
-			try {
-				entries = await fsp.readdir(LOCK_DIR);
-			} catch (error) {
-				const err = error as NodeJS.ErrnoException;
-				if (err.code === "ENOENT") {
-					return {
-						content: [{ type: "text", text: "No locks found." }],
-						details: { locks: [] },
-					};
-				}
-				throw error;
-			}
-
-			entries.sort();
-			if (entries.length === 0) {
-				return {
-					content: [{ type: "text", text: "No locks found." }],
-					details: { locks: [] },
-				};
-			}
-
-			const semantics =
-				"\nSemantics: '<name>' = pi instance is active (processing). " +
-				"'idle:<name>' = pi instance is idle (waiting for user input).";
-			return {
-				content: [{ type: "text", text: `Locks:\n${entries.join("\n")}${semantics}` }],
-				details: { locks: entries.map((name) => ({ name })) },
 			};
 		},
 	});

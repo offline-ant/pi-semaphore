@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOCK_DIR="/tmp/pi-semaphores"
+IDLE_PREFIX="idle:"
+
+sanitize_name() {
+  printf '%s' "${1:-}" | tr -cd '[:alnum:]._-'
+}
+
+ensure_lock_dir() {
+  mkdir -p "$LOCK_DIR"
+  chmod 0777 "$LOCK_DIR" 2>/dev/null || true
+}
+
+default_name() {
+  if [[ -n "${PI_LOCK_NAME:-}" ]]; then
+    local env_name
+    env_name="$(sanitize_name "$PI_LOCK_NAME")"
+    if [[ -n "$env_name" ]]; then
+      printf '%s' "$env_name"
+      return
+    fi
+  fi
+
+  local base
+  base="$(sanitize_name "$(basename "${PWD:-.}")")"
+  if [[ -n "$base" ]]; then
+    printf '%s' "$base"
+  else
+    printf 'session'
+  fi
+}
+
+lock_path() {
+  printf '%s/%s' "$LOCK_DIR" "$1"
+}
+
+idle_path() {
+  printf '%s/%s%s' "$LOCK_DIR" "$IDLE_PREFIX" "$1"
+}
+
+find_unique_name() {
+  local base="$1"
+  local candidate="$base"
+  local n=2
+
+  while [[ -e "$(lock_path "$candidate")" ]]; do
+    candidate="${base}-${n}"
+    n=$((n + 1))
+    if (( n > 1000 )); then
+      candidate="${base}-$$"
+      break
+    fi
+  done
+
+  printf '%s' "$candidate"
+}
+
+clear_idle_markers() {
+  ensure_lock_dir
+  find "$LOCK_DIR" -maxdepth 1 -type f -name "${IDLE_PREFIX}*" -delete 2>/dev/null || true
+}
+
+create_idle_marker() {
+  local name="$1"
+  ensure_lock_dir
+  printf '%s\n' "$name" > "$(idle_path "$name")"
+}
+
+create_lock_dedup() {
+  local base_name="$1"
+  local safe
+  safe="$(sanitize_name "$base_name")"
+  if [[ -z "$safe" ]]; then
+    echo "error: lock name cannot be empty" >&2
+    return 1
+  fi
+
+  ensure_lock_dir
+
+  local unique
+  unique="$(find_unique_name "$safe")"
+  local path
+  path="$(lock_path "$unique")"
+
+  (
+    set -o noclobber
+    printf '%s\n' "$unique" > "$path"
+  ) 2>/dev/null || {
+    echo "error: failed to create lock: $unique" >&2
+    return 1
+  }
+
+  echo "$unique"
+}
+
+release_lock() {
+  local name="$1"
+  local safe
+  safe="$(sanitize_name "$name")"
+  [[ -n "$safe" ]] || return 1
+  local path
+  path="$(lock_path "$safe")"
+
+  if [[ -e "$path" ]]; then
+    rm -f -- "$path"
+    return 0
+  fi
+  return 1
+}
+
+cmd_lock() {
+  local raw_name="${1:-$(default_name)}"
+  local created
+  created="$(create_lock_dedup "$raw_name")"
+  echo "Lock created: $created"
+}
+
+cmd_release() {
+  local name="${1:-$(default_name)}"
+  if release_lock "$name"; then
+    echo "Lock released: $(sanitize_name "$name")"
+  else
+    echo "Lock not found: $(sanitize_name "$name")" >&2
+    return 1
+  fi
+}
+
+cmd_idle() {
+  local name="${1:-$(default_name)}"
+  local safe
+  safe="$(sanitize_name "$name")"
+  if [[ -z "$safe" ]]; then
+    echo "error: lock name cannot be empty" >&2
+    return 1
+  fi
+
+  local path
+  path="$(lock_path "$safe")"
+
+  if [[ ! -e "$path" ]]; then
+    echo "Lock not found: $safe" >&2
+    return 1
+  fi
+
+  rm -f -- "$path"
+  create_idle_marker "$safe"
+  echo "Lock moved to idle: ${IDLE_PREFIX}${safe}"
+}
+
+cmd_list() {
+  ensure_lock_dir
+  find "$LOCK_DIR" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | sort || true
+}
+
+cmd_wait() {
+  local timeout=120
+  local names=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)
+        shift
+        [[ $# -gt 0 ]] || { echo "error: --timeout requires seconds" >&2; return 1; }
+        timeout="$1"
+        shift
+        ;;
+      --timeout=*)
+        timeout="${1#*=}"
+        shift
+        ;;
+      *)
+        names+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    echo "error: wait requires at least one lock name" >&2
+    return 1
+  fi
+
+  local active=()
+  local valid_count=0
+  local n safe p
+
+  for n in "${names[@]}"; do
+    safe="$(sanitize_name "$n")"
+    [[ -n "$safe" ]] || continue
+    valid_count=$((valid_count + 1))
+    p="$(lock_path "$safe")"
+    if [[ -e "$p" ]]; then
+      active+=("$safe")
+    else
+      echo "Lock '$safe' already released (not found)."
+      return 0
+    fi
+  done
+
+  if (( valid_count == 0 )); then
+    echo "error: no valid lock names after sanitization" >&2
+    return 1
+  fi
+
+  local start now elapsed
+  start="$(date +%s)"
+
+  echo "Waiting for any lock: ${active[*]}"
+
+  while true; do
+    for n in "${active[@]}"; do
+      if [[ ! -e "$(lock_path "$n")" ]]; then
+        echo "Lock released: $n"
+        return 0
+      fi
+    done
+
+    now="$(date +%s)"
+    elapsed=$((now - start))
+    if (( elapsed >= timeout )); then
+      echo "Timed out after ${timeout}s waiting for: ${active[*]}" >&2
+      return 124
+    fi
+
+    sleep 0.2
+  done
+}
+
+# Helpers for future extension hooks (agent_start/agent_end parity)
+cmd_agent_start() {
+  local name="${1:-$(default_name)}"
+  local safe
+  safe="$(sanitize_name "$name")"
+  [[ -n "$safe" ]] || { echo "error: lock name cannot be empty" >&2; return 1; }
+
+  ensure_lock_dir
+  clear_idle_markers
+  printf '%s\n' "$safe" > "$(lock_path "$safe")"
+  echo "Locked: $safe"
+}
+
+cmd_agent_end() {
+  local name="${1:-$(default_name)}"
+  local safe
+  safe="$(sanitize_name "$name")"
+  [[ -n "$safe" ]] || { echo "error: lock name cannot be empty" >&2; return 1; }
+
+  rm -f -- "$(lock_path "$safe")"
+  create_idle_marker "$safe"
+  echo "Idle: ${IDLE_PREFIX}${safe}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  pi-semaphore lock [name]
+  pi-semaphore release [name]
+  pi-semaphore idle [name]
+  pi-semaphore wait [--timeout SEC] <name> [name...]
+  pi-semaphore list
+  pi-semaphore agent-start [name]
+  pi-semaphore agent-end [name]
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+
+  case "$cmd" in
+    lock) cmd_lock "$@" ;;
+    release) cmd_release "$@" ;;
+    idle) cmd_idle "$@" ;;
+    wait) cmd_wait "$@" ;;
+    list|lock-list) cmd_list "$@" ;;
+    agent-start) cmd_agent_start "$@" ;;
+    agent-end) cmd_agent_end "$@" ;;
+    -h|--help|help|"") usage ;;
+    *)
+      echo "error: unknown command: $cmd" >&2
+      usage >&2
+      return 1
+      ;;
+  esac
+}
+
+main "$@"

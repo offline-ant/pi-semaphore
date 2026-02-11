@@ -32,6 +32,14 @@ default_name() {
   fi
 }
 
+lock_value() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    printf '%s' "$TMUX_PANE"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 lock_path() {
   printf '%s/%s' "$LOCK_DIR" "$1"
 }
@@ -64,8 +72,9 @@ clear_idle_markers() {
 
 create_idle_marker() {
   local name="$1"
+  local value="$2"
   ensure_lock_dir
-  printf '%s\n' "$name" > "$(idle_path "$name")"
+  printf '%s\n' "$value" > "$(idle_path "$name")"
 }
 
 create_lock_dedup() {
@@ -83,10 +92,12 @@ create_lock_dedup() {
   unique="$(find_unique_name "$safe")"
   local path
   path="$(lock_path "$unique")"
+  local value
+  value="$(lock_value "$unique")"
 
   (
     set -o noclobber
-    printf '%s\n' "$unique" > "$path"
+    printf '%s\n' "$value" > "$path"
   ) 2>/dev/null || {
     echo "error: failed to create lock: $unique" >&2
     return 1
@@ -144,8 +155,14 @@ cmd_idle() {
     return 1
   fi
 
+  local value
+  value="$(head -n 1 "$path" 2>/dev/null || true)"
+  if [[ -z "$value" ]]; then
+    value="$(lock_value "$safe")"
+  fi
+
   rm -f -- "$path"
-  create_idle_marker "$safe"
+  create_idle_marker "$safe" "$value"
   echo "Lock moved to idle: ${IDLE_PREFIX}${safe}"
 }
 
@@ -237,7 +254,7 @@ cmd_agent_start() {
 
   ensure_lock_dir
   clear_idle_markers
-  printf '%s\n' "$safe" > "$(lock_path "$safe")"
+  printf '%s\n' "$(lock_value "$safe")" > "$(lock_path "$safe")"
   echo "Locked: $safe"
 }
 
@@ -248,7 +265,7 @@ cmd_agent_end() {
   [[ -n "$safe" ]] || { echo "error: lock name cannot be empty" >&2; return 1; }
 
   rm -f -- "$(lock_path "$safe")"
-  create_idle_marker "$safe"
+  create_idle_marker "$safe" "$(lock_value "$safe")"
   echo "Idle: ${IDLE_PREFIX}${safe}"
 }
 

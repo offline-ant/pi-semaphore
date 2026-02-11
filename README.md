@@ -1,6 +1,6 @@
 # pi-semaphore
 
-Semaphore locks for [pi](https://github.com/badlogic/pi-mono) - coordinate multiple pi instances.
+Semaphore locks for [pi](https://github.com/badlogic/pi-mono) to coordinate multiple pi instances.
 
 ## Installation
 
@@ -14,142 +14,63 @@ Or try without installing:
 pi -e git:github.com/offline-ant/pi-semaphore
 ```
 
-> **Note:** This extension assumes [pi-tmux](https://github.com/offline-ant/pi-tmux) is also installed.
-
 ## How It Works
 
-While the agent is processing a prompt, a lock file is created in `/tmp/pi-semaphores/<name>`.
+While the agent is processing, a lock file exists at:
 
-The default `<name>` is determined by:
-1. The `PI_LOCK_NAME` environment variable (if set)
-2. Otherwise, the project directory basename
+`/tmp/pi-semaphores/<name>`
 
-If another instance already holds a lock with the same name, a suffix is appended (`-2`, `-3`, etc.) to ensure uniqueness.
+Default `<name>`:
+1. `PI_LOCK_NAME` (if set)
+2. Otherwise, project directory basename
 
-When the agent finishes processing, the lock file is removed and an idle marker (`idle:<name>`) is created to indicate the instance is waiting for input.
+If the same name is already taken, a suffix is appended (`-2`, `-3`, ...).
+
+When processing finishes, the lock is removed and an idle marker is created:
+
+`/tmp/pi-semaphores/idle:<name>`
+
+With tmux integration, lock file content is the pane id (for example `%42`), so other tools can resolve lock name -> pane.
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `PI_LOCK_NAME` | Override the default lock name (useful when spawning pi from tmux windows) |
+| `PI_LOCK_NAME` | Override the default lock name |
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/lock [name]` | Create a named lock (auto-deduplicates if exists) |
+| `/lock [name]` | Create a named lock (auto-deduplicates) |
 | `/release [name]` | Release a named lock |
-| `/wait <name> [name...]` | Wait for any of the named locks to be released |
-| `/lock-list` | List all locks in `/tmp/pi-semaphores/` |
+| `/wait <name> [name...]` | Wait for any named lock to be released |
+| `/lock-list` | List all lock files in `/tmp/pi-semaphores/` |
 
-## Example Usage
+## Example
 
-### Waiting for another pi instance
-
-In terminal 1 (project directory `my-app`):
+Terminal 1:
 ```
-> Do some long running task
+> Do long task
 ```
 
-In terminal 2:
+Terminal 2:
 ```
-> /wait my-app
-Waiting for lock: my-app
-# ... blocks until terminal 1 finishes ...
-Lock released: my-app
-```
-
-Waiting for multiple locks:
-```
-> /wait my-app deploy
-Waiting for any lock: my-app, deploy
-# ... blocks until one is released ...
-Lock released: deploy
-```
-
-### Explicit locks
-
-```
-> /lock deploy
-Lock created: deploy
-
-# In another terminal:
-> /wait deploy
-Waiting for lock: deploy
-
-# Back in first terminal:
-> /release deploy
-Lock released: deploy
-```
-
-### Listing locks
-
-```
-> /lock-list
-Locks:
-my-app
-idle:other-project
-deploy
+> /wait my-project
+Waiting for any lock: my-project
+# ... blocks ...
+Lock released: my-project
 ```
 
 ## Agent Supervisor Pattern
 
-One pi instance can monitor and drive another pi instance. This requires:
+Use with `pi-tmux`:
 
-1. **Semaphore extension** - to wait for the other agent's steps to complete
-2. **Tmux extension** - to send commands and capture output from the other agent
+1. Wait for worker step completion via `semaphore_wait`
+2. Capture worker pane by lock name via `tmux-capture`
+3. Send next instruction via `tmux-send`
 
-The easiest setup is running both pi instances in the same tmux session (different windows). This gives the supervisor agent access to the worker's pane via tmux tools.
-
-### Setup
-
-Start tmux and open two windows:
-```bash
-tmux new-session -s work
-# Window 0: worker agent
-pi
-
-# Ctrl+b c (new window)
-# Window 1: supervisor agent  
-pi
-```
-
-Both agents now share the tmux session. The supervisor (window 1) can:
-- `tmux capture-pane -t %0 -p` - read the worker's screen
-- `tmux send-keys -t %0 "command" Enter` - send input to the worker
-
-### Supervisor Workflow
-
-The supervisor monitors the worker and keeps it running:
-
-```
-1. bash('ls /tmp/pi-semaphores') - find the worker's active lock (e.g., my-app)
-2. semaphore_wait - block until the worker finishes its current step
-3. tmux capture-pane -t %0 -p -S -50 - check output and context usage
-4. Decide what to do:
-   - If context > 70%: trigger state save and /compact
-   - If idle but work remains: send "go" or next instruction
-   - If done: stop
-5. Repeat
-```
-
-### Use Cases
-
-- **Long-running tasks**: Keep work going across context resets via periodic `/compact`
-- **State persistence**: Instruct worker to save progress to files before compaction
-- **Error recovery**: Detect failures and send corrective instructions
-- **Orchestration**: Coordinate multiple workers on different parts of a task
-
-### Example Supervisor Prompt
-
-```
-Monitor the pi instance in window 0. Check every step:
-- If context reaches 70%, tell it to save state to todo.md, then /compact
-- After compaction, tell it to read todo.md and continue
-- If it stops and work remains, send "go"
-- Continue until all tasks are marked done
-```
+Because lock files contain pane ids, supervisors can control worker panes by lock name without spawning them.
 
 ## License
 

@@ -11,7 +11,7 @@ import { Type } from "@sinclair/typebox";
 const SEMAPHORE_SCRIPT = path.resolve(__dirname, "../bin/pi-semaphore");
 
 export function sanitizeName(name: string): string {
-  return name.replace(/[^A-Za-z0-9._-]/g, "");
+  return name.replace(/[^A-Za-z0-9._:-]/g, "");
 }
 
 function parseNames(args: string | undefined): string[] {
@@ -34,7 +34,14 @@ async function runSemaphore(
 }
 
 function resultText(stdout: string, stderr: string): string {
-  const text = stdout.trim() || stderr.trim();
+  const out = stdout.trim();
+  const err = stderr.trim();
+
+  if (out.length > 0 && err.length > 0) {
+    return `${out}\n${err}`;
+  }
+
+  const text = out || err;
   return text.length > 0 ? text : "(no output)";
 }
 

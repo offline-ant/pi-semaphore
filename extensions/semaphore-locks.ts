@@ -29,7 +29,7 @@ async function runSemaphore(
   pi: ExtensionAPI,
   args: string[],
   signal?: AbortSignal,
-): Promise<{ code: number; stdout: string; stderr: string }> {
+): Promise<{ code: number; stdout: string; stderr: string; killed: boolean }> {
   return pi.exec("bash", [SEMAPHORE_SCRIPT, ...args], { signal });
 }
 
@@ -47,6 +47,20 @@ function resultText(stdout: string, stderr: string): string {
 
 export default function semaphoreLocksExtension(pi: ExtensionAPI) {
   let currentLockName: string | null = null;
+
+  // Abort controller for the currently-running semaphore_wait tool.
+  // Set when the tool starts, cleared when it finishes.
+  // The input event handler aborts this so a user message interrupts the wait.
+  let waitAbortController: AbortController | null = null;
+
+  // When the user sends a message while semaphore_wait is blocking,
+  // abort the wait subprocess so the steering message is delivered promptly.
+  pi.on("input", async () => {
+    if (waitAbortController) {
+      waitAbortController.abort();
+    }
+    return { action: "continue" as const };
+  });
 
   pi.on("agent_start", async (_event, ctx) => {
     const result = await runSemaphore(pi, ["agent-start"]);
@@ -166,22 +180,56 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
         };
       }
 
-      const result = await runSemaphore(pi, ["wait", "--timeout", String(timeoutSeconds), ...safeNames], signal);
-      const text = resultText(result.stdout, result.stderr);
-      const found = result.code === 0;
+      // Create a local abort controller so user input can interrupt the wait.
+      // Combine with the tool's signal (abort on Escape) by forwarding it.
+      const localAbort = new AbortController();
+      waitAbortController = localAbort;
 
-      if (result.code !== 0 && result.code !== 124) {
-        return {
-          content: [{ type: "text", text: text }],
-          details: { names: safeNames, found, code: result.code, timeoutSeconds },
-          isError: true,
-        };
+      const onToolAbort = () => localAbort.abort();
+      if (signal) {
+        if (signal.aborted) {
+          localAbort.abort();
+        } else {
+          signal.addEventListener("abort", onToolAbort, { once: true });
+        }
       }
 
-      return {
-        content: [{ type: "text", text }],
-        details: { names: safeNames, found, code: result.code, timeoutSeconds },
-      };
+      try {
+        const result = await runSemaphore(
+          pi,
+          ["wait", "--timeout", String(timeoutSeconds), ...safeNames],
+          localAbort.signal,
+        );
+        const text = resultText(result.stdout, result.stderr);
+        const found = result.code === 0;
+
+        // If killed by user input, report interruption (not an error to the LLM)
+        if (result.killed && localAbort.signal.aborted && !(signal?.aborted)) {
+          return {
+            content: [{ type: "text", text: "Wait interrupted by user message." }],
+            details: { names: safeNames, found: false, code: result.code, timeoutSeconds, interrupted: true },
+          };
+        }
+
+        if (result.code !== 0 && result.code !== 124) {
+          return {
+            content: [{ type: "text", text }],
+            details: { names: safeNames, found, code: result.code, timeoutSeconds },
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{ type: "text", text }],
+          details: { names: safeNames, found, code: result.code, timeoutSeconds },
+        };
+      } finally {
+        waitAbortController = null;
+        if (signal) {
+          signal.removeEventListener("abort", onToolAbort);
+        }
+      }
     },
   });
 }
+

@@ -5,7 +5,7 @@ LOCK_DIR="/tmp/pi-semaphores"
 IDLE_PREFIX="idle:"
 
 sanitize_name() {
-  printf '%s' "${1:-}" | tr -cd '[:alnum:]._-'
+  printf '%s' "${1:-}" | tr -cd '[:alnum:]._:-'
 }
 
 ensure_lock_dir() {
@@ -207,11 +207,29 @@ cmd_wait() {
     safe="$(sanitize_name "$n")"
     [[ -n "$safe" ]] || continue
     valid_count=$((valid_count + 1))
+
+    if [[ "$safe" == "${IDLE_PREFIX}"* ]]; then
+      # Waiting for idle:<name> means waiting for the idle lock to be removed
+      # (session became active again). If marker is absent, it is already un-idle.
+      p="$(lock_path "$safe")"
+      if [[ ! -e "$p" ]]; then
+        echo "Lock '$safe' already un-idle (not found)."
+        return 0
+      fi
+      active+=("$safe")
+      continue
+    fi
+
+    # Waiting for <name>: if active lock is gone, it is already released.
     p="$(lock_path "$safe")"
     if [[ -e "$p" ]]; then
       active+=("$safe")
     else
-      echo "Lock '$safe' already released (not found)."
+      if [[ -e "$(idle_path "$safe")" ]]; then
+        echo "Lock '$safe' already idle."
+      else
+        echo "Lock '$safe' already released (not found)."
+      fi
       return 0
     fi
   done
@@ -228,16 +246,23 @@ cmd_wait() {
 
   while true; do
     for n in "${active[@]}"; do
-      if [[ ! -e "$(lock_path "$n")" ]]; then
-        echo "Lock released: $n"
-        return 0
+      if [[ "$n" == "${IDLE_PREFIX}"* ]]; then
+        if [[ ! -e "$(lock_path "$n")" ]]; then
+          echo "Lock un-idle: $n"
+          return 0
+        fi
+      else
+        if [[ ! -e "$(lock_path "$n")" ]]; then
+          echo "Lock released: $n"
+          return 0
+        fi
       fi
     done
 
     now="$(date +%s)"
     elapsed=$((now - start))
     if (( elapsed >= timeout )); then
-      echo "Timed out after ${timeout}s waiting for: ${active[*]}" >&2
+      echo "Timed out after ${elapsed}s waiting for: ${active[*]}" >&2
       return 124
     fi
 

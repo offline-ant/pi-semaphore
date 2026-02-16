@@ -278,7 +278,7 @@ cmd_agent_start() {
   [[ -n "$safe" ]] || { echo "error: lock name cannot be empty" >&2; return 1; }
 
   ensure_lock_dir
-  clear_idle_markers
+  rm -f -- "$(idle_path "$safe")"
   printf '%s\n' "$(lock_value "$safe")" > "$(lock_path "$safe")"
   echo "Locked: $safe"
 }

@@ -280,6 +280,23 @@ cmd_agent_start() {
   ensure_lock_dir
   rm -f -- "$(idle_path "$safe")"
 
+  # If lock already exists with our value (same pane), reuse it.
+  # This happens when tmux-coding-agent creates the lock before pi starts.
+  local path
+  path="$(lock_path "$safe")"
+  local value
+  value="$(lock_value "$safe")"
+
+  if [[ -e "$path" ]]; then
+    local existing
+    existing="$(head -n 1 "$path" 2>/dev/null || true)"
+    if [[ "$existing" == "$value" ]]; then
+      echo "Locked: $safe"
+      return 0
+    fi
+  fi
+
+  # Lock doesn't exist or belongs to a different pane — use dedup.
   local unique
   unique="$(create_lock_dedup "$safe")"
   echo "Locked: $unique"

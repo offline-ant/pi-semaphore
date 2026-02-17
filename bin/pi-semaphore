@@ -279,8 +279,23 @@ cmd_agent_start() {
 
   ensure_lock_dir
   rm -f -- "$(idle_path "$safe")"
-  printf '%s\n' "$(lock_value "$safe")" > "$(lock_path "$safe")"
-  echo "Locked: $safe"
+
+  local unique
+  unique="$(find_unique_name "$safe")"
+  local path
+  path="$(lock_path "$unique")"
+  local value
+  value="$(lock_value "$unique")"
+
+  (
+    set -o noclobber
+    printf '%s\n' "$value" > "$path"
+  ) 2>/dev/null || {
+    echo "error: failed to create lock: $unique" >&2
+    return 1
+  }
+
+  echo "Locked: $unique"
 }
 
 cmd_agent_end() {

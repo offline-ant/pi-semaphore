@@ -281,20 +281,7 @@ cmd_agent_start() {
   rm -f -- "$(idle_path "$safe")"
 
   local unique
-  unique="$(find_unique_name "$safe")"
-  local path
-  path="$(lock_path "$unique")"
-  local value
-  value="$(lock_value "$unique")"
-
-  (
-    set -o noclobber
-    printf '%s\n' "$value" > "$path"
-  ) 2>/dev/null || {
-    echo "error: failed to create lock: $unique" >&2
-    return 1
-  }
-
+  unique="$(create_lock_dedup "$safe")"
   echo "Locked: $unique"
 }
 

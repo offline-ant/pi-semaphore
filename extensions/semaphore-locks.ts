@@ -48,6 +48,16 @@ function resultText(stdout: string, stderr: string): string {
 export default function semaphoreLocksExtension(pi: ExtensionAPI) {
   let currentLockName: string | null = null;
 
+  // Context alert: release a <name>:context lock when context usage >= threshold.
+  // Set from PI_CONTEXT_ALERT env var. The lock is created by tmux-coding-agent
+  // before pi starts, so we only need to track and release it here.
+  const contextAlertThreshold = (() => {
+    const raw = parseInt(process.env.PI_CONTEXT_ALERT ?? "", 10);
+    return !isNaN(raw) && raw > 0 && raw <= 100 ? raw : null;
+  })();
+  let contextAlertLockName: string | null = null;
+  let contextAlertReleased = false;
+
   // Abort controller for the currently-running semaphore_wait tool.
   // Set when the tool starts, cleared when it finishes.
   // The input event handler aborts this so a user message interrupts the wait.
@@ -68,6 +78,12 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
     if (result.code === 0) {
       const match = text.match(/Locked:\s+(.+)/);
       currentLockName = match?.[1]?.trim() || null;
+
+      // Track context alert lock (created by tmux-coding-agent before pi started)
+      if (contextAlertThreshold && currentLockName && !contextAlertLockName) {
+        contextAlertLockName = `${currentLockName}:context`;
+      }
+
       if (ctx.hasUI && currentLockName) {
         ctx.ui.setStatus("locks", `Locked: ${currentLockName}`);
       }
@@ -79,6 +95,15 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
+    // Check context alert before releasing the main lock
+    if (contextAlertLockName && !contextAlertReleased && contextAlertThreshold) {
+      const usage = ctx.getContextUsage();
+      if (usage?.percent !== null && usage?.percent !== undefined && usage.percent >= contextAlertThreshold) {
+        await runSemaphore(pi, ["release", contextAlertLockName]);
+        contextAlertReleased = true;
+      }
+    }
+
     const args = currentLockName ? ["agent-end", currentLockName] : ["agent-end"];
     const result = await runSemaphore(pi, args);
     if (result.code !== 0 && ctx.hasUI) {
@@ -91,6 +116,10 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // Clean up context alert lock if it was never released
+    if (contextAlertLockName && !contextAlertReleased) {
+      await runSemaphore(pi, ["release", contextAlertLockName]);
+    }
     if (currentLockName) {
       await runSemaphore(pi, ["agent-end", currentLockName]);
     }

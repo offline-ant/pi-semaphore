@@ -209,6 +209,24 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
         };
       }
 
+      // For watch locks (<parent>:watch, <parent>:watch-N), automatically monitor
+      // the parent lock too. If the parent releases before the watch pattern fires,
+      // we report a warning instead of waiting forever on an orphaned watcher.
+      const watchParentMap = new Map<string, string>(); // parent lock name -> watch lock name
+      const parentNames: string[] = [];
+      for (const name of safeNames) {
+        const watchMatch = name.match(/^(.+?):watch(?:-\d+)?$/);
+        if (watchMatch) {
+          const parent = watchMatch[1];
+          // Only add if the parent isn't already in the explicit wait list
+          if (!safeNames.includes(parent)) {
+            watchParentMap.set(parent, name);
+            parentNames.push(parent);
+          }
+        }
+      }
+      const allNames = [...safeNames, ...parentNames];
+
       // Create a local abort controller so user input can interrupt the wait.
       // Combine with the tool's signal (abort on Escape) by forwarding it.
       const localAbort = new AbortController();
@@ -226,7 +244,7 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
       try {
         const result = await runSemaphore(
           pi,
-          ["wait", "--timeout", String(timeoutSeconds), ...safeNames],
+          ["wait", "--timeout", String(timeoutSeconds), ...allNames],
           localAbort.signal,
         );
         const text = resultText(result.stdout, result.stderr);
@@ -238,6 +256,35 @@ export default function semaphoreLocksExtension(pi: ExtensionAPI) {
             content: [{ type: "text", text: "Wait interrupted by user message." }],
             details: { names: safeNames, found: false, code: result.code, timeoutSeconds, interrupted: true },
           };
+        }
+
+        // Check if a parent lock released (rather than the watch lock itself).
+        // cmd_wait outputs one of:
+        //   "Lock released: <name>"         (polling loop)
+        //   "Lock '<name>' already idle."   (early exit, process finished)
+        //   "Lock '<name>' already released (not found)."  (early exit, gone)
+        if (found && watchParentMap.size > 0) {
+          let releasedParent: string | undefined;
+          for (const parent of watchParentMap.keys()) {
+            const escaped = parent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            if (new RegExp(`Lock released:\\s+${escaped}\\b`).test(text)
+              || new RegExp(`Lock '${escaped}' already (idle|released)`).test(text)) {
+              releasedParent = parent;
+              break;
+            }
+          }
+          if (releasedParent) {
+            const watchName = watchParentMap.get(releasedParent)!;
+            // Clean up the orphaned watch lock
+            await runSemaphore(pi, ["release", watchName]);
+            const warning =
+              `⚠️ Parent lock '${releasedParent}' released while waiting for watch '${watchName}'. ` +
+              `The watched process has stopped.`;
+            return {
+              content: [{ type: "text", text: warning }],
+              details: { names: safeNames, found: true, code: 0, timeoutSeconds, parentStopped: releasedParent, watchLock: watchName },
+            };
+          }
         }
 
         if (result.code !== 0 && result.code !== 124) {
